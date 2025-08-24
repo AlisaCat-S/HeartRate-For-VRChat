@@ -20,6 +20,8 @@ struct Config {
     scan_duration_secs: u64,
     retry_delay_secs: u64,
     heart_rate_service_uuid: Uuid,
+    // --- 新增配置项 ---
+    heartbeat_timeout_secs: u64, // 心跳超时时间（秒）
 }
 
 const CONFIG: Config = Config {
@@ -30,12 +32,14 @@ const CONFIG: Config = Config {
         "Xiaomi Smart Band 10",
         "HUAWEI",
         "HONOR",
-    ], // 在这里添加你的设备名称
+    ],
     heart_rate_char_uuid: Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb),
     heart_rate_service_uuid: Uuid::from_u128(0x0000180d_0000_1000_8000_00805f9b34fb),
     max_heart_rate_for_percent: 200.0,
     scan_duration_secs: 5,
-    retry_delay_secs: 10,
+    retry_delay_secs: 5,
+    // --- 设置默认值 ---
+    heartbeat_timeout_secs: 15, // 如果 15 秒没收到数据，就认为断线
 };
 
 // --- 自定义错误类型 ---
@@ -188,12 +192,13 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
         ByName,
         StrongestSignal,
     }
-    
+
 
     // *** 在这里切换模式 ***
     // let selection_mode = SelectionMode::StrongestSignal; //  SelectionMode::ByName
     let selection_mode = SelectionMode::StrongestSignal;
-    
+
+
     // 当使用 ByName 模式时，这个列表会被用到
     let target_device_names = config.target_device_names;
 
@@ -311,8 +316,6 @@ async fn handle_device_connection(
     socket: &UdpSocket,
     config: &Config,
 ) -> Result<()> {
-    // 获取设备属性以显示其名称
-
     println!("\n正在连接设备 {}...", device.address());
     device.connect().await?;
     println!("设备连接成功！正在监听心率...");
@@ -323,7 +326,6 @@ async fn handle_device_connection(
 
     device.discover_services().await?;
 
-    // 查找心率特征
     let hr_char = device
         .characteristics()
         .into_iter()
@@ -335,61 +337,64 @@ async fn handle_device_connection(
         return Err(AppError::SubscriptionFailed);
     }
 
-    // 订阅通知
     device.subscribe(&hr_char).await?;
     let mut notification_stream = device.notifications().await?;
     println!("已成功订阅心率通知。等待数据...");
 
-    // 主数据接收循环
-    while let Some(notification) = notification_stream.next().await {
-        // 蓝牙 GATT 心率服务规范:
-        // - data[0] 是标志位。
-        // - data[1] 是心率值（当标志位的最低位为 0 时，为 UINT8 格式）。
-        if notification.uuid == config.heart_rate_char_uuid && notification.value.len() >= 2 {
-            // --- 新的解析逻辑 ---
-            let flag = notification.value[0];
-
-            // 检查心率值是 8位 (UINT8) 还是 16位 (UINT16)
-            let heart_rate: u16 = if (flag & 0x01) == 0 {
-                // UINT8 格式
-                if notification.value.len() < 2 {
-                    continue;
-                }
-                notification.value[1] as u16
-            } else {
-                // UINT16 格式
-                if notification.value.len() < 3 {
-                    continue;
-                }
-                u16::from_le_bytes([notification.value[1], notification.value[2]])
-            };
-
-            // --- 解析逻辑结束 ---
-
-            // 因为心率可能是 u16，但我们的文件和 OSC 函数接收 u8，
-            // 在这里做一个安全的转换。对于心率来说，超过 255 的情况极少。
-
-            let heart_rate_u8 = heart_rate.min(255) as u8;
-            // let heart_rate = notification.value[1];
-
-            // 新增功能：将心率写入文件
-            if let Err(e) = write_heart_rate_to_file(heart_rate_u8) {
-                // 打印错误但不停下程序，以免影响 OSC 功能
-                eprintln!("\n写入心率到文件时出错: {}", e);
+    // --- 【核心修改】 ---
+    // 使用 `loop` 和 `tokio::time::timeout` 来实现带超时的事件接收
+    loop {
+        match time::timeout(
+            Duration::from_secs(config.heartbeat_timeout_secs),
+            notification_stream.next(),
+        )
+            .await
+        {
+            // Case 1: 超时发生
+            Err(_) => {
+                println!(
+                    "\n未在 {} 秒内收到心率数据，认为连接已断开。",
+                    config.heartbeat_timeout_secs
+                );
+                break; // 跳出循环，触发重连
             }
+            // Case 2: 成功接收到数据
+            Ok(Some(notification)) => {
+                if notification.uuid == config.heart_rate_char_uuid && notification.value.len() >= 2
+                {
+                    // 这里的代码和你原来的一样，用于解析和发送数据
+                    let flag = notification.value[0];
+                    let heart_rate: u16 = if (flag & 0x01) == 0 {
+                        if notification.value.len() < 2 { continue; }
+                        notification.value[1] as u16
+                    } else {
+                        if notification.value.len() < 3 { continue; }
+                        u16::from_le_bytes([notification.value[1], notification.value[2]])
+                    };
 
-            // 发送 OSC 数据
-            match send_osc(socket, heart_rate_u8, config) {
-                Ok(vrc_status) => {
-                    print!("状态 -> {}   \r", vrc_status,);
-                    io::stdout().flush()?; // 刷新 stdout 以确保行立即更新
+                    let heart_rate_u8 = heart_rate.min(255) as u8;
+
+                    if let Err(e) = write_heart_rate_to_file(heart_rate_u8) {
+                        eprintln!("\n写入心率到文件时出错: {}", e);
+                    }
+
+                    match send_osc(socket, heart_rate_u8, config) {
+                        Ok(vrc_status) => {
+                            print!("状态 -> {}   \r", vrc_status);
+                            io::stdout().flush()?;
+                        }
+                        Err(e) => eprintln!("\n发送 OSC 数据时出错: {}", e),
+                    }
                 }
-                Err(e) => eprintln!("\n发送 OSC 数据时出错: {}", e),
+            }
+            // Case 3: 通知流正常关闭 (例如设备主动优雅断连)
+            Ok(None) => {
+                println!("\n通知流已关闭。");
+                break; // 同样跳出循环
             }
         }
     }
 
-    // 如果循环退出，意味着通知流已关闭（断开连接）。
     Ok(())
 }
 
