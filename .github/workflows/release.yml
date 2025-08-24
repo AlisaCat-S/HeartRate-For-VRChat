@@ -27,7 +27,7 @@ jobs:
       - name: Prepare artifact for upload
         # 将可执行文件打包成 zip 方便下载
         run: |
-          $BINARY_NAME = "miband-heart-rate"
+          $BINARY_NAME = "HeartRate-For-VRChat"
           $TAG_NAME = "${{ github.ref_name }}"
           $ARTIFACT_NAME = "$($BINARY_NAME)-$($TAG_NAME)-windows-x86_64"
           $ZIP_FILE = "$($ARTIFACT_NAME).zip"

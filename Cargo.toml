@@ -1,5 +1,5 @@
 [package]
-name = "Miband9_10-HeartRate-For-VRChat"
+name = "HeartRate-For-VRChat"
 authors = ["XiangTian"]
 version = "0.5.0"
 edition = "2021"
