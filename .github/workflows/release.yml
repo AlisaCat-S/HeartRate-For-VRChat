@@ -1,0 +1,44 @@
+name: Release Windows Executable
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*' # 匹配 v1.2.3 或 v1.2.3-alpha 等格式的标签
+
+jobs:
+  build-and-release:
+    name: Build and Release for Windows
+    runs-on: windows-latest # 使用最新的 Windows 运行环境
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build release executable
+        run: cargo build --release
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Prepare artifact for upload
+        # 将可执行文件打包成 zip 方便下载
+        run: |
+          $BINARY_NAME = "miband-heart-rate"
+          $TAG_NAME = "${{ github.ref_name }}"
+          $ARTIFACT_NAME = "$($BINARY_NAME)-$($TAG_NAME)-windows-x86_64"
+          $ZIP_FILE = "$($ARTIFACT_NAME).zip"
+          Compress-Archive -Path "target/release/$($BINARY_NAME).exe" -DestinationPath $ZIP_FILE
+          echo "ASSET_PATH=$ZIP_FILE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "ASSET_NAME=$ZIP_FILE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Create GitHub Release and upload artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

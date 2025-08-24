@@ -1,0 +1,25 @@
+[package]
+name = "Miband9_10-HeartRate-For-VRChat"
+authors = ["XiangTian"]
+version = "0.3.9"
+edition = "2021"
+repository = "https://github.com/AlisaCat-S/HeartRate-For-VRChat"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# 异步运行时，用于处理 async/await。
+# "full" 特性会启用所有功能，包括宏 (`#[tokio::main]`) 和时间 (`time::sleep`)。
+tokio = { version = "1.47.1", features = ["full"] }
+
+# 核心蓝牙 LE (Low Energy) 库。
+btleplug = "0.11"
+
+# 用于处理异步流 (Stream) 的实用工具，代码中用它来处理蓝牙通知。
+futures-util = "0.3"
+
+# 用于生成和解析 OSC (Open Sound Control) 消息，与 VRChat 通信。
+rosc = "0.11.4"
+
+# 用于处理 UUID，代码中用心率服务的标准 UUID。
+uuid = { version = "1.8.0", features = ["v4"] }
