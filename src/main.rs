@@ -11,9 +11,6 @@ use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanF
 use btleplug::platform::{Manager, Peripheral};
 
 // --- 配置区 ---
-
-/// 存放应用程序的所有可配置值。
-/// 这使得管理和未来从文件加载配置变得更加容易。
 struct Config {
     osc_ip: Ipv4Addr,
     osc_port: u16,
@@ -22,7 +19,7 @@ struct Config {
     max_heart_rate_for_percent: f32,
     scan_duration_secs: u64,
     retry_delay_secs: u64,
-    heart_rate_service_uuid: Uuid
+    heart_rate_service_uuid: Uuid,
 }
 
 const CONFIG: Config = Config {
@@ -42,8 +39,6 @@ const CONFIG: Config = Config {
 };
 
 // --- 自定义错误类型 ---
-
-/// 自定义错误枚举，用于更具体的错误处理。
 #[derive(Debug)]
 enum AppError {
     Btleplug(btleplug::Error),
@@ -116,7 +111,7 @@ fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<Strin
     let percent2 = hr_for_percent2 / 240.0;
 
     // 2. 准备用于“整数”的心率值
-    let hr_for_int = (heart_rate).min(240);
+    let hr_for_int = heart_rate.min(240);
 
     // --- 将所有 OSC 消息打包到一个 Bundle 中 ---
 
@@ -171,7 +166,7 @@ fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<Strin
 
 // --- 蓝牙逻辑 ---
 
-/// 扫描并返回第一个与配置中名称匹配的外围设备。
+/// 扫描并返回一个与外围设备。
 async fn find_target_device(manager: &Manager, config: &Config) -> Result<Peripheral> {
     println!("正在扫描蓝牙设备...");
     let adapters = manager.adapters().await?;
@@ -180,26 +175,25 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
         .next()
         .ok_or(AppError::AdapterNotFound)?;
 
-
     // 使用带有服务过滤的扫描
     let scan_filter = ScanFilter {
         services: vec![config.heart_rate_service_uuid],
     };
     // central.start_scan(ScanFilter::default()).await?;    // 扫描所有设备
-    central.start_scan(scan_filter).await?;     // 扫描包含心率服务的设备(可能无法获取设备名称)
+    central.start_scan(scan_filter).await?; // 扫描包含心率服务的设备(可能无法获取设备名称)
     time::sleep(Duration::from_secs(config.scan_duration_secs)).await;
-
 
     // --- 1. 定义选择模式和配置 ---
     enum SelectionMode {
         ByName,
         StrongestSignal,
     }
+    
 
     // *** 在这里切换模式 ***
     // let selection_mode = SelectionMode::StrongestSignal; //  SelectionMode::ByName
-    let selection_mode = SelectionMode::StrongestSignal; 
-
+    let selection_mode = SelectionMode::StrongestSignal;
+    
     // 当使用 ByName 模式时，这个列表会被用到
     let target_device_names = config.target_device_names;
 
@@ -225,8 +219,13 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
 
             // --- 打印逻辑 (和原来类似，稍作调整) ---
             let mac_address = p.address();
-            let device_name = properties.local_name.clone().unwrap_or_else(|| "未知设备 Unknown Device".to_string());
-            let rssi_str = properties.rssi.map_or("N/A".to_string(), |rssi| format!("{} dBm", rssi));
+            let device_name = properties
+                .local_name
+                .clone()
+                .unwrap_or_else(|| "未知设备 Unknown Device".to_string());
+            let rssi_str = properties
+                .rssi
+                .map_or("N/A".to_string(), |rssi| format!("{} dBm", rssi));
 
             let filtered_device_name: String = device_name
                 .chars()
@@ -248,7 +247,10 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
             // 一旦找到第一个匹配项，就不会再更新 `name_match_candidate`
             if name_match_candidate.is_none() {
                 if let Some(name) = &properties.local_name {
-                    if target_device_names.iter().any(|target| name.contains(target)) {
+                    if target_device_names
+                        .iter()
+                        .any(|target| name.contains(target))
+                    {
                         // peripheral `p` 在循环结束后会消失，所以我们需要克隆它来保留所有权
                         name_match_candidate = Some(p.clone());
                     }
@@ -270,19 +272,21 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
             SelectionMode::ByName => {
                 println!("\n选择模式: 按名称查找, 关键字: {:?}", target_device_names);
                 name_match_candidate
-            },
+            }
             SelectionMode::StrongestSignal => {
                 println!("\n选择模式: 选择信号最强的设备");
                 // `strongest_candidate` 是一个元组 (Peripheral, i16)，我们只需要其中的 Peripheral
                 strongest_candidate.map(|(p, _rssi)| p)
-            },
+            }
         };
 
         // --- 处理最终结果 ---
         if let Some(p) = chosen_peripheral {
             // 再次获取属性以便打印最终选择的设备信息
             let props = p.properties().await?.unwrap_or_default();
-            let name: String = props.local_name.unwrap_or("未知设备 Unknown Device".to_string());
+            let name: String = props
+                .local_name
+                .unwrap_or("未知设备 Unknown Device".to_string());
             let filtered_device_name: String = name
                 .chars()
                 // 过滤出 ASCII 字母和数字
@@ -294,57 +298,14 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
             return Ok(p); // 返回找到的设备
         } else {
             println!("\n未找到符合条件的设备。");
-            
         }
     }
-    // 
-    // let peripherals = central.peripherals().await?;
-    // println!("附近设备列表:");
-    // if peripherals.is_empty() {
-    //     println!("未发现任何设备。请检查设备是否开启并处于广播状态。");
-    // } else {
-    //     // 遍历我们找到的设备列表，并打印出更友好的信息
-    //     for p in &peripherals { // 这里使用借用 `&peripherals`，所以不会消耗掉它
-    //         let properties = p.properties().await?.unwrap_or_default();
-    //         let mac_address = p.address();
-    // 
-    //         // 处理设备名称可能为空的情况
-    //         let device_name = properties.local_name.unwrap_or_else(|| "未知设备".to_string()).chars().take(7).collect::<String>();
-    //         let rssi_str = properties.rssi.map_or("N/A".to_string(), |rssi| format!("{} dBm", rssi));
-    // 
-    //         println!(
-    //             "名称: {:<10} | MAC: {} | 信号强度: {}",
-    //             device_name, mac_address, rssi_str
-    //         );
-    //     }
-    // }
-    // for p in peripherals {
-    //     if let Some(props) = p.properties().await? {
-    //         if let Some(name) = props.local_name {
-    //             if config
-    //                 .target_device_names
-    //                 .iter()
-    //                 .any(|target| name.contains(target))
-    //             {
-    //                 let device_name = name.chars().take(7).collect::<String>();
-    //                 println!("选择设备: {} ({})", device_name, p.address());
-    //                 central.stop_scan().await?;
-    //                 return Ok(p);
-    //             }
-    //         }
-    //     }
-    // }
 
     // 如果循环结束仍未找到设备，则返回错误。
     Err(AppError::DeviceNotFound)
 }
 
 /// 处理设备连接的整个生命周期。
-///
-/// ## 重构:
-/// 此函数封装了活动连接的所有逻辑：
-/// 发现服务、订阅通知以及处理数据流。
-/// 当连接丢失时，它会返回。
 async fn handle_device_connection(
     device: &Peripheral,
     socket: &UdpSocket,
@@ -391,21 +352,17 @@ async fn handle_device_connection(
             // 检查心率值是 8位 (UINT8) 还是 16位 (UINT16)
             let heart_rate: u16 = if (flag & 0x01) == 0 {
                 // UINT8 格式
-                if notification.value.len() < 2 { continue; }
+                if notification.value.len() < 2 {
+                    continue;
+                }
                 notification.value[1] as u16
             } else {
                 // UINT16 格式
-                if notification.value.len() < 3 { continue; }
+                if notification.value.len() < 3 {
+                    continue;
+                }
                 u16::from_le_bytes([notification.value[1], notification.value[2]])
             };
-
-            // （可选）解析传感器接触状态
-            // let sensor_contact_supported = (flag & 0x04) != 0;
-            // let sensor_contact_detected = if sensor_contact_supported {
-            //     Some((flag & 0x02) != 0)
-            // } else {
-            //     None
-            // };
 
             // --- 解析逻辑结束 ---
 
@@ -424,13 +381,6 @@ async fn handle_device_connection(
             // 发送 OSC 数据
             match send_osc(socket, heart_rate_u8, config) {
                 Ok(vrc_status) => {
-                    // let contact_status = match sensor_contact_detected {
-                    //     Some(true) => "接触良好",
-                    //     Some(false) => "接触不良",
-                    //     None => "不支持",
-                    // };
-                    // 将所有状态信息打印在同一行，并使用 \r 进行覆盖
-                    // print!("状态 -> {} (传感器: {})   \r", vrc_status, contact_status);
                     print!("状态 -> {}   \r", vrc_status,);
                     io::stdout().flush()?; // 刷新 stdout 以确保行立即更新
                 }
@@ -444,15 +394,6 @@ async fn handle_device_connection(
 }
 
 // --- 主应用程序逻辑 ---
-
-/// 主应用程序循环，现在更清晰、更健壮。
-///
-/// ## 重构:
-/// 主循环的职责现在简化为：
-/// 1. 查找设备。
-/// 2. 在一个循环中，尝试使用 `handle_device_connection` 连接并处理连接。
-/// 3. 如果连接断开，则等待并重试。
-/// 4. 如果设备完全丢失，则返回扫描。
 async fn main_loop(config: &'static Config) -> Result<()> {
     let manager = Manager::new().await?;
 
