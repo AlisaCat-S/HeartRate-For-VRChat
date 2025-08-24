@@ -102,11 +102,14 @@ fn write_heart_rate_to_file(heart_rate: u8) -> io::Result<()> {
 // --- OSC 通信 ---
 
 /// 使用复用的 Socket 通过 OSC 格式化并发送心率数据。
-///
-/// ## 优化:
 /// - 使用 OSC Bundle 将四个消息合并到一个网络数据包中发送，以提高效率和数据同步性。
-/// - 对发送的 OSC 值进行了限制，以防止在 VRChat 中出现极端值。
 fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<String> {
+    // --- 【核心修改】 ---
+    // 新增逻辑：判断心率是否为 0。
+    // 如果心率大于 0，则认为设备已连接并处于活动状态。
+    // 否则，视为未佩戴或无数据，is_active 为 false。
+    let is_active = heart_rate > 0;
+
     // 1. 计算用于“百分比”的心率值
     let hr_for_percent = (heart_rate as f32).min(config.max_heart_rate_for_percent);
     let percent = hr_for_percent / config.max_heart_rate_for_percent;
@@ -118,8 +121,6 @@ fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<Strin
     let hr_for_int = heart_rate.min(240);
 
     // --- 将所有 OSC 消息打包到一个 Bundle 中 ---
-
-    // 创建一个 OSC Bundle。timetag 设置为 immediate() 意味着接收方应立即处理这些消息。
     let bundle = rosc::OscPacket::Bundle(rosc::OscBundle {
         timetag: rosc::OscTime {
             seconds: 0,
@@ -129,12 +130,14 @@ fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<Strin
             // 消息 1: hr_connected
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/hr_connected".to_string(),
-                args: vec![rosc::OscType::Bool(true)],
+                // --- 修改：使用 is_active 变量 ---
+                args: vec![rosc::OscType::Bool(is_active)],
             }),
             // 消息 2: isHRActive
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/isHRActive".to_string(),
-                args: vec![rosc::OscType::Bool(true)],
+                // --- 修改：使用 is_active 变量 ---
+                args: vec![rosc::OscType::Bool(is_active)],
             }),
             // 消息 3: hr_percent (Float)
             rosc::OscPacket::Message(rosc::OscMessage {
@@ -155,16 +158,13 @@ fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<Strin
     });
 
     // --- 编码并发送单个数据包 ---
-
-    // 将整个 Bundle 编码成字节数据
     let buf = rosc::encoder::encode(&bundle)?;
-    // 只需一次网络发送
     socket.send(&buf)?;
 
-    // 返回一个格式化的状态字符串用于在控制台显示
+    // --- 修改：更新状态字符串以包含活动状态 ---
     Ok(format!(
-        "心率: {} -> (OSC数据) -> Int: {}, Float/200: {:.2} %  Float2/240: {:.2} %",
-        heart_rate, hr_for_int, percent, percent2
+        "心率: {} -> (OSC数据) -> Active: {}, Int: {}, Float/200: {:.2} %  Float2/240: {:.2} %",
+        heart_rate, is_active, hr_for_int, percent, percent2
     ))
 }
 
@@ -465,7 +465,7 @@ async fn main() {
     println!("2.心率会同步输出到程序目录下的 HeartRate.txt 文件中,供其他软件使用");
     println!("适配预制件1：https://booth.pm/ja/items/6224828");
     println!("适配预制件2：https://booth.pm/ja/items/7197938");
-    println!("PS:仅限能用————理论兼容所有Pulsoid适配的预制件。\nBy 箱天: 喵喵喵———— ");
+    println!("PS:仅限能用————理论兼容所有Pulsoid适配的预制件。\nAuthor 箱天: 喵喵喵———— ");
     println!();
 
     if let Err(e) = main_loop(&CONFIG).await {

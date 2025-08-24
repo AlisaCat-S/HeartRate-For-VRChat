@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Miband9_10-HeartRate-For-VRChat"
-version = "0.3.9"
+version = "0.5.0"
 dependencies = [
  "btleplug",
  "futures-util",
