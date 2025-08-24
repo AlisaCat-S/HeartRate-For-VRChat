@@ -9,7 +9,8 @@ jobs:
   build-and-release:
     name: Build and Release for Windows
     runs-on: windows-latest # 使用最新的 Windows 运行环境
-
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
