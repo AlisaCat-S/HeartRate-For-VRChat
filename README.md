@@ -18,6 +18,7 @@
 
 -   Xiaomi Smart Band 9
 -   Xiaomi Smart Band 10
+-   Xiaomi Smart Band 10 Pro
 -   HUAWEI (华为手环/手表)
 -   HONOR (荣耀手环/手表)
 
