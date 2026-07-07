@@ -1,46 +1,189 @@
+use std::env;
+use std::future::Future;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::{error, fmt, fs};
 
 use futures_util::stream::StreamExt;
+use serde::Deserialize;
 use tokio::time;
 use uuid::Uuid;
 
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Manager, Peripheral};
 
-// --- 配置区 ---
+// --- 蓝牙标准 UUID（固定值，无需配置） ---
+const HEART_RATE_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000180d_0000_1000_8000_00805f9b34fb);
+const HEART_RATE_CHAR_UUID: Uuid = Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb);
+
+/// connect / discover_services 的超时（秒）：WinRT 上对不可达设备
+/// 这些调用可能挂起数十秒甚至不返回，需要兜底。
+const BLE_OP_TIMEOUT_SECS: u64 = 30;
+
+/// 连续多少次连接失败（期间未收到任何心率数据）后放弃该设备、重新扫描。
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+// --- 配置（从 exe 同目录的 config.toml 加载，缺失时使用默认值并自动生成模板） ---
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 struct Config {
-    osc_ip: Ipv4Addr,
+    /// 设备选择模式:
+    /// "auto"      = 优先匹配 target_device_names，无匹配时回退到信号最强（默认）
+    /// "name"      = 仅按名称匹配，找不到则重试扫描
+    /// "strongest" = 仅选择信号最强的心率设备
+    selection_mode: String,
+    target_device_names: Vec<String>,
+    osc_ip: String,
     osc_port: u16,
-    target_device_names: &'static [&'static str],
-    heart_rate_char_uuid: Uuid,
     max_heart_rate_for_percent: f32,
     scan_duration_secs: u64,
     retry_delay_secs: u64,
-    heart_rate_service_uuid: Uuid,
-    // --- 新增配置项 ---
-    heartbeat_timeout_secs: u64, // 心跳超时时间（秒）
+    /// 心跳超时时间（秒）：超过该时间未收到心率数据则重连
+    heartbeat_timeout_secs: u64,
+    /// 是否将心率实时写入 HeartRate.txt（供 OBS 等读取）
+    write_heart_rate_file: bool,
 }
 
-const CONFIG: Config = Config {
-    osc_ip: Ipv4Addr::new(127, 0, 0, 1),
-    osc_port: 9000,
-    target_device_names: &[
-        "Xiaomi Smart Band 9",
-        "Xiaomi Smart Band 10",
-        "HUAWEI",
-        "HONOR",
-    ],
-    heart_rate_char_uuid: Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb),
-    heart_rate_service_uuid: Uuid::from_u128(0x0000180d_0000_1000_8000_00805f9b34fb),
-    max_heart_rate_for_percent: 200.0,
-    scan_duration_secs: 5,
-    retry_delay_secs: 5,
-    // --- 设置默认值 ---
-    heartbeat_timeout_secs: 15, // 如果 15 秒没收到数据，就认为断线
-};
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            selection_mode: "auto".to_string(),
+            target_device_names: vec![
+                "Xiaomi Smart Band 9".to_string(),
+                "Xiaomi Smart Band 10".to_string(),
+                "HUAWEI".to_string(),
+                "HONOR".to_string(),
+            ],
+            osc_ip: "127.0.0.1".to_string(),
+            osc_port: 9000,
+            max_heart_rate_for_percent: 200.0,
+            scan_duration_secs: 5,
+            retry_delay_secs: 5,
+            heartbeat_timeout_secs: 15,
+            write_heart_rate_file: false,
+        }
+    }
+}
+
+const CONFIG_TEMPLATE: &str = r#"# HeartRate-For-VRChat 配置文件
+# 删除本文件后重新运行程序可恢复默认配置。
+
+# 设备选择模式:
+#   "auto"      = 优先匹配 target_device_names 中的名称，无匹配时回退到信号最强（推荐）
+#   "name"      = 仅按名称匹配，找不到则不断重试扫描
+#   "strongest" = 仅选择信号最强的心率设备（附近有他人的心率设备时可能连错）
+selection_mode = "auto"
+
+# 按名称匹配时使用的设备名关键字（包含匹配）
+target_device_names = [
+    "Xiaomi Smart Band 9",
+    "Xiaomi Smart Band 10",
+    "HUAWEI",
+    "HONOR",
+]
+
+# OSC 发送目标。本机 VRChat 保持默认即可；
+# Quest 一体机请改为头显的局域网 IP；VRChat 用 --osc 改过端口的请同步修改。
+osc_ip = "127.0.0.1"
+osc_port = 9000
+
+# hr_percent 参数的分母（心率/该值 = 百分比）
+max_heart_rate_for_percent = 200.0
+
+# 每次扫描时长（秒）
+scan_duration_secs = 5
+
+# 断开后重试间隔（秒）
+retry_delay_secs = 5
+
+# 心跳超时时间（秒）：超过该时间未收到心率数据则断开重连
+heartbeat_timeout_secs = 15
+
+# 是否将心率实时写入程序目录下的 HeartRate.txt（供 OBS 等其他软件读取）。
+# 默认关闭以减少磁盘写入；需要 OBS 联动时改为 true。
+write_heart_rate_file = false
+"#;
+
+/// 获取 exe 所在目录；失败时回退到当前工作目录（绝对路径）。
+fn exe_dir() -> PathBuf {
+    match env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        Some(dir) => dir,
+        None => {
+            let fallback = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            eprintln!(
+                "警告：无法获取 exe 所在目录，配置和 HeartRate.txt 将使用当前目录: {}",
+                fallback.display()
+            );
+            fallback
+        }
+    }
+}
+
+/// 从 exe 同目录加载 config.toml；文件不存在则生成模板并返回默认配置。
+/// 加载后对取值做合法性校验/钳制。
+fn load_config(dir: &Path) -> Config {
+    let path = dir.join("config.toml");
+    let mut config = match fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(config) => {
+                println!("已加载配置文件: {}", path.display());
+                config
+            }
+            Err(e) => {
+                eprintln!("=============================================");
+                eprintln!("警告：配置文件解析失败，本次运行将忽略其中的【全部】设置，使用默认配置！");
+                eprintln!("文件: {}", path.display());
+                eprintln!("原因: {}", e);
+                eprintln!("请修正后重启程序（或删除该文件以重新生成模板）。");
+                eprintln!("=============================================");
+                Config::default()
+            }
+        },
+        Err(_) => {
+            match fs::write(&path, CONFIG_TEMPLATE) {
+                Ok(()) => println!("已生成默认配置文件: {}（可编辑后重启程序生效）", path.display()),
+                Err(e) => eprintln!("无法生成配置文件 {}: {}，将使用默认配置。", path.display(), e),
+            }
+            Config::default()
+        }
+    };
+
+    // 校验 selection_mode，非法值回退 auto 并给出明确提示
+    let mode = config.selection_mode.trim().to_ascii_lowercase();
+    if matches!(mode.as_str(), "auto" | "name" | "strongest") {
+        config.selection_mode = mode;
+    } else {
+        eprintln!(
+            "警告：selection_mode = \"{}\" 不是有效值（auto / name / strongest），将按 auto 处理。",
+            config.selection_mode
+        );
+        config.selection_mode = "auto".to_string();
+    }
+
+    // 数值下限钳制，避免 0 值导致扫描不到设备或连接后立即超时
+    if config.heartbeat_timeout_secs < 3 {
+        eprintln!("警告：heartbeat_timeout_secs 过小，已调整为 3。");
+        config.heartbeat_timeout_secs = 3;
+    }
+    if config.scan_duration_secs < 1 {
+        eprintln!("警告：scan_duration_secs 过小，已调整为 1。");
+        config.scan_duration_secs = 1;
+    }
+    if config.retry_delay_secs < 1 {
+        eprintln!("警告：retry_delay_secs 过小，已调整为 1。");
+        config.retry_delay_secs = 1;
+    }
+    if config.max_heart_rate_for_percent < 1.0 {
+        eprintln!("警告：max_heart_rate_for_percent 过小，已调整为 200。");
+        config.max_heart_rate_for_percent = 200.0;
+    }
+
+    config
+}
 
 // --- 自定义错误类型 ---
 #[derive(Debug)]
@@ -89,67 +232,63 @@ impl From<rosc::OscError> for AppError {
 
 type Result<T> = std::result::Result<T, AppError>;
 
-// --- 文件输出 ---
-
-/// 将心率写入程序目录下的 HeartRate.txt 文件。
-/// 每次调用都会覆盖文件内容。
-fn write_heart_rate_to_file(heart_rate: u8) -> io::Result<()> {
-    // 使用 fs::write 可以简洁地实现文件的创建/覆盖和写入
-    fs::write("HeartRate.txt", heart_rate.to_string())?;
-    Ok(())
+/// 为可能挂起的 BLE 操作加超时兜底。
+async fn ble_timeout<F, T>(fut: F) -> Result<T>
+where
+    F: Future<Output = btleplug::Result<T>>,
+{
+    let dur = Duration::from_secs(BLE_OP_TIMEOUT_SECS);
+    match time::timeout(dur, fut).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(AppError::Btleplug(btleplug::Error::TimedOut(dur))),
+    }
 }
 
 // --- OSC 通信 ---
 
-/// 使用复用的 Socket 通过 OSC 格式化并发送心率数据。
-/// - 使用 OSC Bundle 将四个消息合并到一个网络数据包中发送，以提高效率和数据同步性。
-fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<String> {
-    // --- 【核心修改】 ---
-    // 新增逻辑：判断心率是否为 0。
-    // 如果心率大于 0，则认为设备已连接并处于活动状态。
-    // 否则，视为未佩戴或无数据，is_active 为 false。
+/// 通过 OSC 格式化并发送心率数据。
+/// 使用 OSC Bundle 将所有消息合并到一个网络数据包中发送。
+/// Windows 上目标端口无人监听（VRChat 未启动）时 UDP 可能返回
+/// WSAECONNRESET(10054)——这只表示"对端没人听"，视为已发送。
+fn send_osc(
+    socket: &UdpSocket,
+    osc_addr: SocketAddrV4,
+    heart_rate: u8,
+    config: &Config,
+) -> Result<String> {
+    // 心率大于 0 视为已佩戴/有数据；0 视为未佩戴或已断开。
     let is_active = heart_rate > 0;
 
-    // 1. 计算用于“百分比”的心率值
-    let hr_for_percent = (heart_rate as f32).min(config.max_heart_rate_for_percent);
-    let percent = hr_for_percent / config.max_heart_rate_for_percent;
+    let max_hr = config.max_heart_rate_for_percent.max(1.0);
+    let percent = (heart_rate as f32).min(max_hr) / max_hr;
 
-    let hr_for_percent2 = (heart_rate as f32).min(240.0);
-    let percent2 = hr_for_percent2 / 240.0;
+    let percent2 = (heart_rate as f32).min(240.0) / 240.0;
 
-    // 2. 准备用于“整数”的心率值
     let hr_for_int = heart_rate.min(240);
 
-    // --- 将所有 OSC 消息打包到一个 Bundle 中 ---
     let bundle = rosc::OscPacket::Bundle(rosc::OscBundle {
+        // {0, 1} 是 OSC 规范中的 "immediately"
         timetag: rosc::OscTime {
             seconds: 0,
             fractional: 1,
         },
         content: vec![
-            // 消息 1: hr_connected
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/hr_connected".to_string(),
-                // --- 修改：使用 is_active 变量 ---
                 args: vec![rosc::OscType::Bool(is_active)],
             }),
-            // 消息 2: isHRActive
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/isHRActive".to_string(),
-                // --- 修改：使用 is_active 变量 ---
                 args: vec![rosc::OscType::Bool(is_active)],
             }),
-            // 消息 3: hr_percent (Float)
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/hr_percent".to_string(),
                 args: vec![rosc::OscType::Float(percent)],
             }),
-            // 消息 3.5: hr_percent (Float)
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/VRCOSC/Heartrate/Normalised".to_string(),
                 args: vec![rosc::OscType::Float(percent2)],
             }),
-            // 消息 4: HR (Int)
             rosc::OscPacket::Message(rosc::OscMessage {
                 addr: "/avatar/parameters/HR".to_string(),
                 args: vec![rosc::OscType::Int(hr_for_int as i32)],
@@ -157,20 +296,87 @@ fn send_osc(socket: &UdpSocket, heart_rate: u8, config: &Config) -> Result<Strin
         ],
     });
 
-    // --- 编码并发送单个数据包 ---
     let buf = rosc::encoder::encode(&bundle)?;
-    socket.send(&buf)?;
+    if let Err(e) = socket.send_to(&buf, osc_addr) {
+        if e.kind() != io::ErrorKind::ConnectionReset {
+            return Err(e.into());
+        }
+    }
 
-    // --- 修改：更新状态字符串以包含活动状态 ---
     Ok(format!(
-        "心率: {} -> (OSC数据) -> Active: {}, Int: {}, Float/200: {:.2} %  Float2/240: {:.2} %",
-        heart_rate, is_active, hr_for_int, percent, percent2
+        "心率: {} -> (OSC数据) -> Active: {}, Int: {}, Float/{}: {:.2}  Float/240: {:.2}",
+        heart_rate, is_active, hr_for_int, max_hr, percent, percent2
     ))
+}
+
+/// 断开/退出时向 VRChat 发送清零状态（is_active=false, HR=0），
+/// 若启用了文件输出则把 HeartRate.txt 写为 0，避免 avatar 和 OBS 残留旧心率。
+fn clear_state(socket: &UdpSocket, osc_addr: SocketAddrV4, config: &Config, hr_file: &Path) {
+    let _ = send_osc(socket, osc_addr, 0, config);
+    if config.write_heart_rate_file {
+        let _ = fs::write(hr_file, "0");
+    }
+}
+
+// --- 退出清理（Ctrl-C / 关闭窗口 / 注销 / 关机） ---
+
+struct CleanupCtx {
+    osc_addr: SocketAddrV4,
+    config: Config,
+    hr_file: PathBuf,
+}
+
+static CLEANUP_CTX: OnceLock<CleanupCtx> = OnceLock::new();
+static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 只执行一次的退出清理。
+fn run_exit_cleanup() {
+    if CLEANUP_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(ctx) = CLEANUP_CTX.get() {
+        match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => clear_state(&socket, ctx.osc_addr, &ctx.config, &ctx.hr_file),
+            Err(_) => {
+                if ctx.config.write_heart_rate_file {
+                    let _ = fs::write(&ctx.hr_file, "0");
+                }
+            }
+        }
+    }
+}
+
+/// 注册控制台事件处理器。
+/// 不使用 ctrlc crate：它的处理例程立即返回、闭包在另一线程异步执行，
+/// CTRL_CLOSE_EVENT（点 X 关窗）下会与进程终止竞争，清理大概率来不及跑。
+/// 这里直接在处理例程内【同步】完成清理再返回（CLOSE 事件下例程有约 5 秒预算）。
+#[cfg(windows)]
+fn register_exit_handler() -> bool {
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+    };
+
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        run_exit_cleanup();
+        match ctrl_type {
+            // Ctrl-C / Ctrl-Break：系统不主动终止进程，由我们自己退出
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => std::process::exit(0),
+            // CLOSE / LOGOFF / SHUTDOWN：返回 FALSE，交给系统继续默认终止流程
+            _ => 0,
+        }
+    }
+
+    unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
+}
+
+#[cfg(not(windows))]
+fn register_exit_handler() -> bool {
+    false
 }
 
 // --- 蓝牙逻辑 ---
 
-/// 扫描并返回一个与外围设备。
+/// 扫描并返回一个目标外围设备。
 async fn find_target_device(manager: &Manager, config: &Config) -> Result<Peripheral> {
     println!("正在扫描蓝牙设备...");
     let adapters = manager.adapters().await?;
@@ -179,176 +385,173 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
         .next()
         .ok_or(AppError::AdapterNotFound)?;
 
-    // 使用带有服务过滤的扫描
+    // 只扫描广播了心率服务 (0x180D) 的设备
     let scan_filter = ScanFilter {
-        services: vec![config.heart_rate_service_uuid],
+        services: vec![HEART_RATE_SERVICE_UUID],
     };
-    // central.start_scan(ScanFilter::default()).await?;    // 扫描所有设备
-    central.start_scan(scan_filter).await?; // 扫描包含心率服务的设备(可能无法获取设备名称)
+    central.start_scan(scan_filter).await?;
     time::sleep(Duration::from_secs(config.scan_duration_secs)).await;
 
-    // --- 1. 定义选择模式和配置 ---
-    enum SelectionMode {
-        ByName,
-        StrongestSignal,
-    }
-
-
-    // *** 在这里切换模式 ***
-    // let selection_mode = SelectionMode::StrongestSignal; //  SelectionMode::ByName
-    let selection_mode = SelectionMode::StrongestSignal;
-
-
-    // 当使用 ByName 模式时，这个列表会被用到
-    let target_device_names = config.target_device_names;
-
-    // --- 2. 扫描并处理设备 ---
     let peripherals = central.peripherals().await?;
     println!("附近设备列表:");
 
+    let mut strongest_candidate: Option<(Peripheral, i16)> = None;
+    let mut name_match_candidate: Option<Peripheral> = None;
+
     if peripherals.is_empty() {
         println!("未发现任何设备。请检查设备是否开启并处于广播状态。");
-    } else {
-        // --- 3. 单次遍历，同时完成打印和寻找候选设备 ---
-        let mut strongest_candidate: Option<(Peripheral, i16)> = None;
-        let mut name_match_candidate: Option<Peripheral> = None;
+    }
 
-        // 我们将使用一个循环来完成所有事情
-        for p in peripherals {
-            // 为了避免多次调用 .properties().await?，我们获取一次并复用
-            // 如果获取不到属性，就跳过这个设备
-            let properties = match p.properties().await? {
-                Some(props) => props,
-                None => continue,
-            };
-
-            // --- 打印逻辑 (和原来类似，稍作调整) ---
-            let mac_address = p.address();
-            let device_name = properties
-                .local_name
-                .clone()
-                .unwrap_or_else(|| "未知设备 Unknown Device".to_string());
-            let rssi_str = properties
-                .rssi
-                .map_or("N/A".to_string(), |rssi| format!("{} dBm", rssi));
-
-            let filtered_device_name: String = device_name
-                .chars()
-                // 过滤出 ASCII 字母和数字
-                .filter(|c| c.is_ascii_alphanumeric())
-                .collect();
-
-            println!(
-                "名称: {:<15} | MAC: {} | 信号强度: {}",
-                // 同样，为了防止过滤后的名称过长，我们截取前15个字符
-                filtered_device_name.chars().take(15).collect::<String>(),
-                mac_address,
-                rssi_str
-            );
-
-            // --- 候选设备选择逻辑 ---
-
-            // 检查是否符合“按名称选择”的条件
-            // 一旦找到第一个匹配项，就不会再更新 `name_match_candidate`
-            if name_match_candidate.is_none() {
-                if let Some(name) = &properties.local_name {
-                    if target_device_names
-                        .iter()
-                        .any(|target| name.contains(target))
-                    {
-                        // peripheral `p` 在循环结束后会消失，所以我们需要克隆它来保留所有权
-                        name_match_candidate = Some(p.clone());
-                    }
-                }
-            }
-
-            // 检查是否是“信号最强”的设备
-            if let Some(rssi) = properties.rssi {
-                // 如果 `strongest_candidate` 是空的，或者当前设备的信号更强
-                if strongest_candidate.is_none() || rssi > strongest_candidate.as_ref().unwrap().1 {
-                    // 更新最强者
-                    strongest_candidate = Some((p.clone(), rssi));
-                }
-            }
-        } // 循环结束
-
-        // --- 根据配置模式，从候选者中选出最终设备 ---
-        let chosen_peripheral = match selection_mode {
-            SelectionMode::ByName => {
-                println!("\n选择模式: 按名称查找, 关键字: {:?}", target_device_names);
-                name_match_candidate
-            }
-            SelectionMode::StrongestSignal => {
-                println!("\n选择模式: 选择信号最强的设备");
-                // `strongest_candidate` 是一个元组 (Peripheral, i16)，我们只需要其中的 Peripheral
-                strongest_candidate.map(|(p, _rssi)| p)
-            }
+    for p in peripherals {
+        // 获取不到属性的设备直接跳过
+        let properties = match p.properties().await {
+            Ok(Some(props)) => props,
+            _ => continue,
         };
 
-        // --- 处理最终结果 ---
-        if let Some(p) = chosen_peripheral {
-            // 再次获取属性以便打印最终选择的设备信息
-            let props = p.properties().await?.unwrap_or_default();
-            let name: String = props
-                .local_name
-                .unwrap_or("未知设备 Unknown Device".to_string());
-            let filtered_device_name: String = name
-                .chars()
-                // 过滤出 ASCII 字母和数字
-                .filter(|c| c.is_ascii_alphanumeric())
-                .collect();
-            println!("选择设备: {:?} ({})", filtered_device_name, p.address());
+        let mac_address = p.address();
+        let device_name = properties
+            .local_name
+            .clone()
+            .unwrap_or_else(|| "未知设备 Unknown Device".to_string());
+        let rssi_str = properties
+            .rssi
+            .map_or("N/A".to_string(), |rssi| format!("{} dBm", rssi));
 
-            central.stop_scan().await?;
-            return Ok(p); // 返回找到的设备
-        } else {
-            println!("\n未找到符合条件的设备。");
+        let filtered_device_name: String = device_name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+
+        println!(
+            "名称: {:<15} | MAC: {} | 信号强度: {}",
+            filtered_device_name.chars().take(15).collect::<String>(),
+            mac_address,
+            rssi_str
+        );
+
+        // 名称匹配候选（保留第一个匹配项）
+        if name_match_candidate.is_none() {
+            if let Some(name) = &properties.local_name {
+                if config
+                    .target_device_names
+                    .iter()
+                    .any(|target| name.contains(target.as_str()))
+                {
+                    name_match_candidate = Some(p.clone());
+                }
+            }
+        }
+
+        // 信号最强候选
+        if let Some(rssi) = properties.rssi {
+            if strongest_candidate
+                .as_ref()
+                .is_none_or(|(_, best)| rssi > *best)
+            {
+                strongest_candidate = Some((p.clone(), rssi));
+            }
         }
     }
 
-    // 如果循环结束仍未找到设备，则返回错误。
-    Err(AppError::DeviceNotFound)
+    let chosen_peripheral = match config.selection_mode.as_str() {
+        "name" => {
+            println!(
+                "\n选择模式: 按名称匹配, 关键字: {:?}",
+                config.target_device_names
+            );
+            name_match_candidate
+        }
+        "strongest" => {
+            println!("\n选择模式: 选择信号最强的设备");
+            strongest_candidate.map(|(p, _rssi)| p)
+        }
+        _ => {
+            println!(
+                "\n选择模式: 自动（优先匹配名称 {:?}，无匹配时选择信号最强）",
+                config.target_device_names
+            );
+            name_match_candidate.or(strongest_candidate.map(|(p, _rssi)| p))
+        }
+    };
+
+    // 无论成功与否都停止扫描
+    let _ = central.stop_scan().await;
+
+    match chosen_peripheral {
+        Some(p) => {
+            let props = p.properties().await?.unwrap_or_default();
+            let name = props
+                .local_name
+                .unwrap_or_else(|| "未知设备 Unknown Device".to_string());
+            let filtered_device_name: String = name
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect();
+            println!("选择设备: {:?} ({})", filtered_device_name, p.address());
+            Ok(p)
+        }
+        None => {
+            println!("\n未找到符合条件的设备。");
+            Err(AppError::DeviceNotFound)
+        }
+    }
 }
 
 /// 处理设备连接的整个生命周期。
+/// 返回 Ok(true) 表示本次连接期间至少收到过一次心率数据；
+/// 断开清理（disconnect）由调用方统一执行。
 async fn handle_device_connection(
     device: &Peripheral,
     socket: &UdpSocket,
+    osc_addr: SocketAddrV4,
     config: &Config,
-) -> Result<()> {
-    println!("\n正在连接设备 {}...", device.address());
-    device.connect().await?;
+    hr_file: &Path,
+) -> Result<bool> {
+    // is_connected 查询失败时视为未连接，直接尝试 connect
+    if !device.is_connected().await.unwrap_or(false) {
+        println!("\n正在连接设备 {}...", device.address());
+        ble_timeout(device.connect()).await?;
+    }
     println!("设备连接成功！正在监听心率...");
-    println!(
-        "正在向 OSC 地址 {}:{} 发送数据",
-        config.osc_ip, config.osc_port
-    );
+    println!("正在向 OSC 地址 {} 发送数据", osc_addr);
 
-    device.discover_services().await?;
+    ble_timeout(device.discover_services()).await?;
 
     let hr_char = device
         .characteristics()
         .into_iter()
-        .find(|c| c.uuid == config.heart_rate_char_uuid)
+        .find(|c| c.uuid == HEART_RATE_CHAR_UUID)
         .ok_or(AppError::CharacteristicNotFound)?;
 
-    if !hr_char.properties.contains(CharPropFlags::NOTIFY) {
-        eprintln!("错误：心率特征不支持通知 (Notify)。");
+    // Notify 和 Indicate 都可以订阅（btleplug 会自动选择正确的 CCCD 值）
+    if !hr_char
+        .properties
+        .intersects(CharPropFlags::NOTIFY | CharPropFlags::INDICATE)
+    {
+        eprintln!("错误：心率特征不支持通知 (Notify/Indicate)。");
         return Err(AppError::SubscriptionFailed);
     }
 
-    device.subscribe(&hr_char).await?;
+    ble_timeout(device.subscribe(&hr_char)).await?;
     let mut notification_stream = device.notifications().await?;
     println!("已成功订阅心率通知。等待数据...");
 
-    // --- 【核心修改】 ---
+    let mut received_any = false;
+    // 心率数值变化时才写文件：fs::write 每次都是完整的打开/截断/写/关闭，
+    // 还可能触发杀毒软件实时扫描，是本程序最重的单个动作
+    let mut last_written_hr: Option<u8> = None;
+    // 错误只提示一次，恢复后重置（避免 VRChat 未启动时每秒刷屏）
+    let mut osc_error_shown = false;
+    let mut file_error_shown = false;
+
     // 使用 `loop` 和 `tokio::time::timeout` 来实现带超时的事件接收
     loop {
         match time::timeout(
             Duration::from_secs(config.heartbeat_timeout_secs),
             notification_stream.next(),
         )
-            .await
+        .await
         {
             // Case 1: 超时发生
             Err(_) => {
@@ -356,56 +559,79 @@ async fn handle_device_connection(
                     "\n未在 {} 秒内收到心率数据，认为连接已断开。",
                     config.heartbeat_timeout_secs
                 );
-                break; // 跳出循环，触发重连
+                break;
             }
             // Case 2: 成功接收到数据
             Ok(Some(notification)) => {
-                if notification.uuid == config.heart_rate_char_uuid && notification.value.len() >= 2
-                {
-                    // 这里的代码和你原来的一样，用于解析和发送数据
+                if notification.uuid == HEART_RATE_CHAR_UUID && notification.value.len() >= 2 {
+                    // 解析 GATT Heart Rate Measurement: flags 位 0 决定 8/16 位格式
                     let flag = notification.value[0];
                     let heart_rate: u16 = if (flag & 0x01) == 0 {
-                        if notification.value.len() < 2 { continue; }
                         notification.value[1] as u16
                     } else {
-                        if notification.value.len() < 3 { continue; }
+                        if notification.value.len() < 3 {
+                            continue;
+                        }
                         u16::from_le_bytes([notification.value[1], notification.value[2]])
                     };
 
+                    received_any = true;
                     let heart_rate_u8 = heart_rate.min(255) as u8;
 
-                    if let Err(e) = write_heart_rate_to_file(heart_rate_u8) {
-                        eprintln!("\n写入心率到文件时出错: {}", e);
+                    if config.write_heart_rate_file && last_written_hr != Some(heart_rate_u8) {
+                        match fs::write(hr_file, heart_rate_u8.to_string()) {
+                            Ok(()) => {
+                                last_written_hr = Some(heart_rate_u8);
+                                file_error_shown = false;
+                            }
+                            Err(e) => {
+                                last_written_hr = None;
+                                if !file_error_shown {
+                                    eprintln!(
+                                        "\n写入心率到文件 {} 时出错: {}（恢复前不再重复提示）",
+                                        hr_file.display(),
+                                        e
+                                    );
+                                    file_error_shown = true;
+                                }
+                            }
+                        }
                     }
 
-                    match send_osc(socket, heart_rate_u8, config) {
+                    match send_osc(socket, osc_addr, heart_rate_u8, config) {
                         Ok(vrc_status) => {
+                            osc_error_shown = false;
                             print!("状态 -> {}   \r", vrc_status);
-                            io::stdout().flush()?;
+                            let _ = io::stdout().flush();
                         }
-                        Err(e) => eprintln!("\n发送 OSC 数据时出错: {}", e),
+                        Err(e) => {
+                            if !osc_error_shown {
+                                eprintln!("\n发送 OSC 数据时出错: {}（将继续重试，恢复前不再重复提示）", e);
+                                osc_error_shown = true;
+                            }
+                        }
                     }
                 }
             }
             // Case 3: 通知流正常关闭 (例如设备主动优雅断连)
             Ok(None) => {
                 println!("\n通知流已关闭。");
-                break; // 同样跳出循环
+                break;
             }
         }
     }
 
-    Ok(())
+    // 释放订阅；断开连接由调用方统一处理
+    let _ = device.unsubscribe(&hr_char).await;
+    Ok(received_any)
 }
 
 // --- 主应用程序逻辑 ---
-async fn main_loop(config: &'static Config) -> Result<()> {
+async fn main_loop(config: &Config, osc_addr: SocketAddrV4, hr_file: &Path) -> Result<()> {
     let manager = Manager::new().await?;
 
-    // --- 优化：一次性创建 UDP 套接字并复用它。 ---
-    let osc_addr = SocketAddrV4::new(config.osc_ip, config.osc_port);
-    let socket = UdpSocket::bind("0.0.0.0:0")?; // 绑定到任何可用的本地端口
-    socket.connect(osc_addr)?;
+    // 一次性创建 UDP 套接字并复用（用 send_to 发送）
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
     println!("OSC Socket 已创建，将发送到 {}", osc_addr);
 
     loop {
@@ -416,60 +642,106 @@ async fn main_loop(config: &'static Config) -> Result<()> {
                 println!("\n错误: {}\n请检查设备是否在附近，电脑蓝牙是否开启。设备是否被其它心率接收设备连接。", e);
                 println!("将在 {} 秒后重试扫描...", config.retry_delay_secs);
                 time::sleep(Duration::from_secs(config.retry_delay_secs)).await;
-                continue; // 重新开始扫描
+                continue;
             }
         };
 
-        // 用于处理与已找到设备的连接的内部循环
+        // 内部循环：对同一设备重试连接。
+        // 连续 MAX_CONSECUTIVE_FAILURES 次未收到任何心率数据则放弃该设备、重新扫描
+        // （设备可能已关机/走远/更换了随机 MAC 地址）。
+        let mut consecutive_failures: u32 = 0;
         loop {
-            // `is_connected` 检查有助于避免尝试连接到已连接的外围设备。
-            // 在某些平台上，这可以防止突然断开连接后出错。
-            if !device.is_connected().await? {
-                if let Err(e) = handle_device_connection(&device, &socket, config).await {
-                    eprintln!("\n处理连接时发生错误: {}", e);
+            let received_any =
+                match handle_device_connection(&device, &socket, osc_addr, config, hr_file).await {
+                    Ok(received) => received,
+                    Err(e) => {
+                        eprintln!("\n处理连接时发生错误: {}", e);
+                        false
+                    }
+                };
+
+            // 无论因超时、流关闭还是错误退出，都显式断开连接，
+            // 确保下一轮能重新走完整的 connect/subscribe 流程，
+            // 避免链路残留导致"看似在重连、实际永不重订阅"的死循环。
+            let _ = device.disconnect().await;
+
+            // 断开期间向 VRChat 发送未佩戴状态，并清零 HeartRate.txt
+            clear_state(&socket, osc_addr, config, hr_file);
+
+            if received_any {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    println!(
+                        "\n连续 {} 次未能从设备获取心率数据，将重新开始扫描...",
+                        consecutive_failures
+                    );
+                    break;
                 }
             }
 
-            // 如果代码执行到这里，说明连接已断开或建立失败。
             println!(
                 "\n连接已断开。将在 {} 秒后尝试重新连接...",
                 config.retry_delay_secs
             );
             time::sleep(Duration::from_secs(config.retry_delay_secs)).await;
-
-            // 在重试之前，检查设备是否仍被适配器“知晓”。
-            // 如果不是，我们需要跳出并重新扫描。
-            if manager
-                .adapters()
-                .await?
-                .into_iter()
-                .next()
-                .ok_or(AppError::AdapterNotFound)?
-                .peripherals()
-                .await?
-                .iter()
-                .all(|p| p.address() != device.address())
-            {
-                println!("设备已从适配器列表中消失，将重新开始扫描...");
-                break; // 跳出内部循环以重新扫描
-            }
         }
     }
 }
 
-#[tokio::main]
+/// 出错退出前暂停，避免双击运行时窗口一闪而过看不到错误信息。
+fn pause_before_exit() {
+    println!("按回车键退出...");
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+}
+
+// 单线程运行时足矣：本程序每秒只处理一条蓝牙通知，
+// 默认的多线程运行时会按 CPU 核数起 worker 线程，纯属浪费。
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    println!("HeartRate For VRChat v{}", env!("CARGO_PKG_VERSION")); // 版本号更新
-    println!("1.用于通过蓝牙接收心率广播数据，并发送至VRChat OSC");
-    println!("支持设备: 小米手环 9/10、荣耀手环、华为手环/手表");
-    println!("2.心率会同步输出到程序目录下的 HeartRate.txt 文件中,供其他软件使用");
+    println!("HeartRate For VRChat v{}", env!("CARGO_PKG_VERSION"));
+    println!("1.通过蓝牙连接心率设备（任何标准 GATT 心率服务 0x180D 设备），将心率发送至 VRChat OSC");
+    println!("2.可选：在 config.toml 中开启 write_heart_rate_file 后，心率会同步写入程序目录下的 HeartRate.txt（供 OBS 等软件使用，默认关闭）");
+    println!("3.连接模式、设备名、OSC 地址等可在程序目录下的 config.toml 中修改");
+    println!("发送的 OSC 参数列表见 README（hr_connected / isHRActive / hr_percent / VRCOSC Normalised / HR）");
     println!("适配预制件1：https://booth.pm/ja/items/6224828");
     println!("适配预制件2：https://booth.pm/ja/items/7197938");
-    println!("PS:仅限能用————理论兼容所有Pulsoid适配的预制件。\nAuthor 箱天: 喵喵喵———— ");
+    println!("Author 箱天: 喵喵喵———— ");
     println!();
 
-    if let Err(e) = main_loop(&CONFIG).await {
+    let dir = exe_dir();
+    let config = load_config(&dir);
+    let hr_file = dir.join("HeartRate.txt");
+
+    let osc_ip: Ipv4Addr = match config.osc_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => {
+            eprintln!(
+                "配置中的 osc_ip \"{}\" 不是有效的 IPv4 地址，将使用 127.0.0.1。",
+                config.osc_ip
+            );
+            Ipv4Addr::LOCALHOST
+        }
+    };
+    let osc_addr = SocketAddrV4::new(osc_ip, config.osc_port);
+
+    // 注册退出清理（Ctrl-C / 点 X 关窗 / 注销 / 关机时向 VRChat 发送清零状态）
+    let _ = CLEANUP_CTX.set(CleanupCtx {
+        osc_addr,
+        config: config.clone(),
+        hr_file: hr_file.clone(),
+    });
+    if !register_exit_handler() {
+        eprintln!("注册退出清理处理器失败（退出时 VRChat 可能残留最后一次心率）。");
+    }
+
+    if let Err(e) = main_loop(&config, osc_addr, &hr_file).await {
         eprintln!("\n发生错误: {}", e);
+        eprintln!("请检查电脑是否有蓝牙适配器、蓝牙服务是否已启动。");
+        pause_before_exit();
+        return;
     }
 
     println!("\n程序已停止。");

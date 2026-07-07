@@ -1,16 +1,17 @@
 [package]
 name = "HeartRate-For-VRChat"
 authors = ["XiangTian"]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
+rust-version = "1.82"
 repository = "https://github.com/AlisaCat-S/HeartRate-For-VRChat"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 # 异步运行时，用于处理 async/await。
-# "full" 特性会启用所有功能，包括宏 (`#[tokio::main]`) 和时间 (`time::sleep`)。
-tokio = { version = "1.47.1", features = ["full"] }
+# 只启用实际用到的特性：单线程运行时、宏 (`#[tokio::main]`) 和时间 (`time::sleep`/`timeout`)。
+tokio = { version = "1.47.1", features = ["rt", "macros", "time"] }
 
 # 核心蓝牙 LE (Low Energy) 库。
 btleplug = "0.11"
@@ -21,5 +22,21 @@ futures-util = "0.3"
 # 用于生成和解析 OSC (Open Sound Control) 消息，与 VRChat 通信。
 rosc = "0.11.4"
 
-# 用于处理 UUID，代码中用心率服务的标准 UUID。
-uuid = { version = "1.8.0", features = ["v4"] }
+# 用于处理 UUID，代码中用心率服务的标准 UUID（只需默认能力，无需 v4 随机生成）。
+uuid = "1"
+
+# 配置文件 (config.toml) 的解析。
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# 直接注册控制台事件处理器（SetConsoleCtrlHandler），在处理例程内同步完成
+# 退出清理——ctrlc crate 的闭包在另一线程异步执行，点 X 关窗时会与进程终止
+# 竞争，清理大概率来不及运行。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
