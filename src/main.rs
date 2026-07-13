@@ -27,8 +27,8 @@ const BLE_OP_TIMEOUT_SECS: u64 = 30;
 /// 连续多少次连接失败（期间未收到任何心率数据）后放弃该设备、重新扫描。
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-// --- 配置（从 exe 同目录的 config.toml 加载，缺失时使用默认值并自动生成模板） ---
-#[derive(Debug, Clone, Deserialize)]
+// --- 配置（从可执行文件同目录的 config.toml 加载，缺失时使用默认值并自动生成模板） ---
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 struct Config {
     /// 设备选择模式:
@@ -69,48 +69,14 @@ impl Default for Config {
     }
 }
 
-const CONFIG_TEMPLATE: &str = r#"# HeartRate-For-VRChat 配置文件
-# 删除本文件后重新运行程序可恢复默认配置。
-
-# 设备选择模式:
-#   "auto"      = 优先匹配 target_device_names 中的名称，无匹配时回退到信号最强（推荐）
-#   "name"      = 仅按名称匹配，找不到则不断重试扫描
-#   "strongest" = 仅选择信号最强的心率设备（附近有他人的心率设备时可能连错）
-selection_mode = "auto"
-
-# 按名称匹配时使用的设备名关键字（包含匹配）
-target_device_names = [
-    "Xiaomi Smart Band 9",
-    "Xiaomi Smart Band 10",
-    "HUAWEI",
-    "HONOR",
-]
-
-# OSC 发送目标。本机 VRChat 保持默认即可；
-# Quest 一体机请改为头显的局域网 IP；VRChat 用 --osc 改过端口的请同步修改。
-osc_ip = "127.0.0.1"
-osc_port = 9000
-
-# hr_percent 参数的分母（心率/该值 = 百分比）
-max_heart_rate_for_percent = 200.0
-
-# 每次扫描时长（秒）
-scan_duration_secs = 5
-
-# 断开后重试间隔（秒）
-retry_delay_secs = 5
-
-# 心跳超时时间（秒）：超过该时间未收到心率数据则断开重连
-heartbeat_timeout_secs = 15
-
-# 是否将心率实时写入程序目录下的 HeartRate.txt（供 OBS 等其他软件读取）。
-# 默认关闭以减少磁盘写入；需要 OBS 联动时改为 true。
-write_heart_rate_file = false
-"#;
+const CONFIG_TEMPLATE: &str = include_str!("../config.example.toml");
 
 /// 获取 exe 所在目录；失败时回退到当前工作目录（绝对路径）。
 fn exe_dir() -> PathBuf {
-    match env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+    match env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
         Some(dir) => dir,
         None => {
             let fallback = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -135,7 +101,9 @@ fn load_config(dir: &Path) -> Config {
             }
             Err(e) => {
                 eprintln!("=============================================");
-                eprintln!("警告：配置文件解析失败，本次运行将忽略其中的【全部】设置，使用默认配置！");
+                eprintln!(
+                    "警告：配置文件解析失败，本次运行将忽略其中的【全部】设置，使用默认配置！"
+                );
                 eprintln!("文件: {}", path.display());
                 eprintln!("原因: {}", e);
                 eprintln!("请修正后重启程序（或删除该文件以重新生成模板）。");
@@ -145,8 +113,15 @@ fn load_config(dir: &Path) -> Config {
         },
         Err(_) => {
             match fs::write(&path, CONFIG_TEMPLATE) {
-                Ok(()) => println!("已生成默认配置文件: {}（可编辑后重启程序生效）", path.display()),
-                Err(e) => eprintln!("无法生成配置文件 {}: {}，将使用默认配置。", path.display(), e),
+                Ok(()) => println!(
+                    "已生成默认配置文件: {}（可编辑后重启程序生效）",
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "无法生成配置文件 {}: {}，将使用默认配置。",
+                    path.display(),
+                    e
+                ),
             }
             Config::default()
         }
@@ -183,6 +158,23 @@ fn load_config(dir: &Path) -> Config {
     }
 
     config
+}
+
+/// 将配置中的 OSC IPv4 地址和端口解析为发送目标。
+/// 地址非法时保持现有行为：提示后回退到本机，但仍使用配置的端口。
+fn resolve_osc_addr(config: &Config) -> SocketAddrV4 {
+    let osc_ip: Ipv4Addr = match config.osc_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => {
+            eprintln!(
+                "配置中的 osc_ip \"{}\" 不是有效的 IPv4 地址，将使用 127.0.0.1。",
+                config.osc_ip
+            );
+            Ipv4Addr::LOCALHOST
+        }
+    };
+
+    SocketAddrV4::new(osc_ip, config.osc_port)
 }
 
 // --- 自定义错误类型 ---
@@ -318,7 +310,7 @@ fn clear_state(socket: &UdpSocket, osc_addr: SocketAddrV4, config: &Config, hr_f
     }
 }
 
-// --- 退出清理（Ctrl-C / 关闭窗口 / 注销 / 关机） ---
+// --- 退出清理（Windows 控制台事件 / Unix SIGINT、SIGTERM） ---
 
 struct CleanupCtx {
     osc_addr: SocketAddrV4,
@@ -369,9 +361,16 @@ fn register_exit_handler() -> bool {
     unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
 }
 
-#[cfg(not(windows))]
-fn register_exit_handler() -> bool {
-    false
+/// 等待 Unix 的交互退出或服务终止信号。
+#[cfg(unix)]
+async fn wait_for_exit_signal() -> io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 // --- 蓝牙逻辑 ---
@@ -484,10 +483,8 @@ async fn find_target_device(manager: &Manager, config: &Config) -> Result<Periph
             let name = props
                 .local_name
                 .unwrap_or_else(|| "未知设备 Unknown Device".to_string());
-            let filtered_device_name: String = name
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .collect();
+            let filtered_device_name: String =
+                name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
             println!("选择设备: {:?} ({})", filtered_device_name, p.address());
             Ok(p)
         }
@@ -606,7 +603,10 @@ async fn handle_device_connection(
                         }
                         Err(e) => {
                             if !osc_error_shown {
-                                eprintln!("\n发送 OSC 数据时出错: {}（将继续重试，恢复前不再重复提示）", e);
+                                eprintln!(
+                                    "\n发送 OSC 数据时出错: {}（将继续重试，恢复前不再重复提示）",
+                                    e
+                                );
                                 osc_error_shown = true;
                             }
                         }
@@ -690,6 +690,25 @@ async fn main_loop(config: &Config, osc_addr: SocketAddrV4, hr_file: &Path) -> R
     }
 }
 
+/// Unix 上让退出信号与长期运行的蓝牙循环竞争，确保进程终止前发送清零状态。
+#[cfg(unix)]
+async fn run_application(config: &Config, osc_addr: SocketAddrV4, hr_file: &Path) -> Result<()> {
+    tokio::select! {
+        result = main_loop(config, osc_addr, hr_file) => result,
+        signal_result = wait_for_exit_signal() => {
+            signal_result?;
+            println!("\n收到退出信号，正在清理状态...");
+            run_exit_cleanup();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_application(config: &Config, osc_addr: SocketAddrV4, hr_file: &Path) -> Result<()> {
+    main_loop(config, osc_addr, hr_file).await
+}
+
 /// 出错退出前暂停，避免双击运行时窗口一闪而过看不到错误信息。
 fn pause_before_exit() {
     println!("按回车键退出...");
@@ -702,7 +721,9 @@ fn pause_before_exit() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!("HeartRate For VRChat v{}", env!("CARGO_PKG_VERSION"));
-    println!("1.通过蓝牙连接心率设备（任何标准 GATT 心率服务 0x180D 设备），将心率发送至 VRChat OSC");
+    println!(
+        "1.通过蓝牙连接心率设备（任何标准 GATT 心率服务 0x180D 设备），将心率发送至 VRChat OSC"
+    );
     println!("2.可选：在 config.toml 中开启 write_heart_rate_file 后，心率会同步写入程序目录下的 HeartRate.txt（供 OBS 等软件使用，默认关闭）");
     println!("3.连接模式、设备名、OSC 地址等可在程序目录下的 config.toml 中修改");
     println!("发送的 OSC 参数列表见 README（hr_connected / isHRActive / hr_percent / VRCOSC Normalised / HR）");
@@ -715,34 +736,141 @@ async fn main() {
     let config = load_config(&dir);
     let hr_file = dir.join("HeartRate.txt");
 
-    let osc_ip: Ipv4Addr = match config.osc_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => {
-            eprintln!(
-                "配置中的 osc_ip \"{}\" 不是有效的 IPv4 地址，将使用 127.0.0.1。",
-                config.osc_ip
-            );
-            Ipv4Addr::LOCALHOST
-        }
-    };
-    let osc_addr = SocketAddrV4::new(osc_ip, config.osc_port);
+    let osc_addr = resolve_osc_addr(&config);
 
-    // 注册退出清理（Ctrl-C / 点 X 关窗 / 注销 / 关机时向 VRChat 发送清零状态）
+    // 初始化各平台共用的退出清理上下文。
     let _ = CLEANUP_CTX.set(CleanupCtx {
         osc_addr,
         config: config.clone(),
         hr_file: hr_file.clone(),
     });
+    #[cfg(windows)]
     if !register_exit_handler() {
         eprintln!("注册退出清理处理器失败（退出时 VRChat 可能残留最后一次心率）。");
     }
 
-    if let Err(e) = main_loop(&config, osc_addr, &hr_file).await {
+    if let Err(e) = run_application(&config, osc_addr, &hr_file).await {
         eprintln!("\n发生错误: {}", e);
-        eprintln!("请检查电脑是否有蓝牙适配器、蓝牙服务是否已启动。");
+        eprintln!("请检查系统是否有蓝牙适配器、蓝牙服务是否已启动。");
         pause_before_exit();
         return;
     }
 
     println!("\n程序已停止。");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn receive_packet(socket: &UdpSocket) -> rosc::OscPacket {
+        let mut buf = [0_u8; 2048];
+        let (len, _) = socket.recv_from(&mut buf).expect("receive OSC packet");
+        let (remaining, packet) = rosc::decoder::decode_udp(&buf[..len]).expect("decode OSC");
+        assert!(remaining.is_empty());
+        packet
+    }
+
+    fn message_args<'a>(packet: &'a rosc::OscPacket, address: &str) -> &'a [rosc::OscType] {
+        let rosc::OscPacket::Bundle(bundle) = packet else {
+            panic!("expected OSC bundle");
+        };
+
+        bundle
+            .content
+            .iter()
+            .find_map(|packet| match packet {
+                rosc::OscPacket::Message(message) if message.addr == address => {
+                    Some(message.args.as_slice())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing OSC message {address}"))
+    }
+
+    #[test]
+    fn config_template_is_valid_and_uses_default_osc_target() {
+        let config: Config = toml::from_str(CONFIG_TEMPLATE).expect("parse config template");
+
+        assert_eq!(config, Config::default());
+        assert_eq!(
+            resolve_osc_addr(&config),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9000)
+        );
+    }
+
+    #[test]
+    fn resolve_osc_addr_preserves_valid_remote_ipv4_and_port() {
+        let config = Config {
+            osc_ip: "192.168.1.42".to_string(),
+            osc_port: 9123,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_osc_addr(&config),
+            SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 42), 9123)
+        );
+    }
+
+    #[test]
+    fn resolve_osc_addr_falls_back_to_localhost_and_preserves_port() {
+        let config = Config {
+            osc_ip: "not-an-ip".to_string(),
+            osc_port: 9456,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_osc_addr(&config),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9456)
+        );
+    }
+
+    #[test]
+    fn configured_destination_receives_normal_and_cleared_osc_state() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind OSC receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set receive timeout");
+        let receiver_addr = match receiver.local_addr().expect("read receiver address") {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("expected IPv4 receiver"),
+        };
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind OSC sender");
+        let config = Config {
+            osc_ip: receiver_addr.ip().to_string(),
+            osc_port: receiver_addr.port(),
+            ..Config::default()
+        };
+        let osc_addr = resolve_osc_addr(&config);
+
+        send_osc(&sender, osc_addr, 77, &config).expect("send normal OSC state");
+        let normal_packet = receive_packet(&receiver);
+        assert_eq!(
+            message_args(&normal_packet, "/avatar/parameters/HR"),
+            [rosc::OscType::Int(77)]
+        );
+        assert_eq!(
+            message_args(&normal_packet, "/avatar/parameters/hr_connected"),
+            [rosc::OscType::Bool(true)]
+        );
+
+        clear_state(
+            &sender,
+            osc_addr,
+            &config,
+            Path::new("unused-heart-rate.txt"),
+        );
+        let cleared_packet = receive_packet(&receiver);
+        assert_eq!(
+            message_args(&cleared_packet, "/avatar/parameters/HR"),
+            [rosc::OscType::Int(0)]
+        );
+        assert_eq!(
+            message_args(&cleared_packet, "/avatar/parameters/hr_connected"),
+            [rosc::OscType::Bool(false)]
+        );
+    }
 }

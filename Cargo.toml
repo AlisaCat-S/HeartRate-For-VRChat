@@ -10,8 +10,8 @@ repository = "https://github.com/AlisaCat-S/HeartRate-For-VRChat"
 
 [dependencies]
 # 异步运行时，用于处理 async/await。
-# 只启用实际用到的特性：单线程运行时、宏 (`#[tokio::main]`) 和时间 (`time::sleep`/`timeout`)。
-tokio = { version = "1.47.1", features = ["rt", "macros", "time"] }
+# 只启用实际用到的特性：单线程运行时、宏、时间和 Unix 退出信号。
+tokio = { version = "1.47.1", features = ["rt", "macros", "time", "signal"] }
 
 # 核心蓝牙 LE (Low Energy) 库。
 btleplug = "0.11"

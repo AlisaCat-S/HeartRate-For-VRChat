@@ -1,3 +1,5 @@
 /target
+/dist
+/config.toml
 HeartRate.txt
 /.idea/

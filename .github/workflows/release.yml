@@ -1,45 +1,263 @@
-name: Release Windows Executable
+name: Build and Release
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*' # 匹配 v1.2.3 或 v1.2.3-alpha 等格式的标签
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: HeartRate-For-VRChat
 
 jobs:
-  build-and-release:
-    name: Build and Release for Windows
-    runs-on: windows-latest # 使用最新的 Windows 运行环境
-    permissions:
-      contents: write
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
+      - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: rustfmt, clippy
 
-      - name: Build release executable
-        run: cargo build --release
-        env:
-          CARGO_TERM_COLOR: always
-
-      - name: Prepare artifact for upload
-        # 将可执行文件打包成 zip 方便下载
-        run: |
-          $BINARY_NAME = "HeartRate-For-VRChat"
-          $TAG_NAME = "${{ github.ref_name }}"
-          $ARTIFACT_NAME = "$($BINARY_NAME)-$($TAG_NAME)-windows-x86_64"
-          $ZIP_FILE = "$($ARTIFACT_NAME).zip"
-          Compress-Archive -Path "target/release/$($BINARY_NAME).exe" -DestinationPath $ZIP_FILE
-          echo "ASSET_PATH=$ZIP_FILE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "ASSET_NAME=$ZIP_FILE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify Rust host
         shell: pwsh
+        run: |
+          $HostTriple = (rustc -vV | Select-String '^host: ').Line.Substring(6)
+          if ($HostTriple -ne 'x86_64-pc-windows-msvc') {
+            throw "Unexpected Rust host: $HostTriple"
+          }
 
-      - name: Create GitHub Release and upload artifact
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package and inspect archive
+        id: package
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $Version = $env:GITHUB_REF_NAME
+          } else {
+            $Version = "ci-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+
+          $RootName = "$env:BINARY_NAME-$Version-windows-x86_64"
+          $StageDir = Join-Path 'dist' $RootName
+          $ArchivePath = Join-Path 'dist' "$RootName.zip"
+          $VerifyDir = Join-Path 'dist' 'verify'
+
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          Copy-Item "target/release/$env:BINARY_NAME.exe" (Join-Path $StageDir "$env:BINARY_NAME.exe")
+          Copy-Item 'config.example.toml' (Join-Path $StageDir 'config.toml')
+          Copy-Item 'README.md' (Join-Path $StageDir 'README.md')
+          Copy-Item 'LICENSE' (Join-Path $StageDir 'LICENSE')
+
+          Compress-Archive -Path $StageDir -DestinationPath $ArchivePath -Force
+          Expand-Archive -Path $ArchivePath -DestinationPath $VerifyDir -Force
+
+          $ExpectedFiles = @(
+            "$RootName/$env:BINARY_NAME.exe",
+            "$RootName/config.toml",
+            "$RootName/README.md",
+            "$RootName/LICENSE"
+          )
+          foreach ($RelativePath in $ExpectedFiles) {
+            if (-not (Test-Path (Join-Path $VerifyDir $RelativePath) -PathType Leaf)) {
+              throw "Archive is missing: $RelativePath"
+            }
+          }
+
+          "archive=$ArchivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload release candidate
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  build-linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:20.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            expected_machine: Advanced Micro Devices X86-64
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            expected_machine: AArch64
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      RUST_TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            gzip \
+            libdbus-1-dev \
+            pkg-config \
+            tar
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+
+      - name: Verify Rust host
+        run: |
+          actual_host=$(rustc -vV | sed -n 's/^host: //p')
+          if [[ "$actual_host" != "$RUST_TARGET" ]]; then
+            echo "Unexpected Rust host: $actual_host (expected $RUST_TARGET)" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked --target "$RUST_TARGET"
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked --target "$RUST_TARGET" -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "$RUST_TARGET"
+
+      - name: Verify Linux binary compatibility
+        run: |
+          bash .github/scripts/check-linux-binary.sh \
+            "target/$RUST_TARGET/release/$BINARY_NAME" \
+            '${{ matrix.expected_machine }}' \
+            2.31
+
+      - name: Package and inspect archive
+        id: package
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version=$GITHUB_REF_NAME
+          else
+            version="ci-${GITHUB_SHA:0:7}"
+          fi
+
+          root_name="$BINARY_NAME-$version-linux-${{ matrix.arch }}"
+          stage_dir="dist/$root_name"
+          archive_path="dist/$root_name.tar.gz"
+
+          install -D -m 0755 "target/$RUST_TARGET/release/$BINARY_NAME" "$stage_dir/$BINARY_NAME"
+          install -D -m 0644 config.example.toml "$stage_dir/config.toml"
+          install -D -m 0644 README.md "$stage_dir/README.md"
+          install -D -m 0644 LICENSE "$stage_dir/LICENSE"
+          tar -C dist -czf "$archive_path" "$root_name"
+
+          for relative_path in "$BINARY_NAME" config.toml README.md LICENSE; do
+            if ! tar -tzf "$archive_path" | grep -Fx "$root_name/$relative_path" >/dev/null; then
+              echo "Archive is missing: $root_name/$relative_path" >&2
+              exit 1
+            fi
+          done
+
+          echo "archive=$archive_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release candidate
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-windows
+      - build-linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    timeout-minutes: 10
+
+    steps:
+      - name: Download release candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify complete release asset set
+        shell: bash
+        run: |
+          expected_assets=(
+            "$BINARY_NAME-$GITHUB_REF_NAME-windows-x86_64.zip"
+            "$BINARY_NAME-$GITHUB_REF_NAME-linux-x86_64.tar.gz"
+            "$BINARY_NAME-$GITHUB_REF_NAME-linux-aarch64.tar.gz"
+          )
+
+          mapfile -t actual_assets < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ ${#actual_assets[@]} -ne ${#expected_assets[@]} ]]; then
+            printf 'Unexpected release assets:\n%s\n' "${actual_assets[*]}" >&2
+            exit 1
+          fi
+
+          for asset in "${expected_assets[@]}"; do
+            if [[ ! -f "release-assets/$asset" ]]; then
+              echo "Missing release asset: $asset" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET_PATH }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: release-assets/*

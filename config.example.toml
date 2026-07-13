@@ -1,0 +1,38 @@
+# HeartRate-For-VRChat 配置文件
+# 删除 config.toml 后重新运行程序可恢复默认配置。
+
+# 设备选择模式:
+#   "auto"      = 优先匹配 target_device_names 中的名称，无匹配时回退到信号最强（推荐）
+#   "name"      = 仅按名称匹配，找不到则不断重试扫描
+#   "strongest" = 仅选择信号最强的心率设备（附近有他人的心率设备时可能连错）
+selection_mode = "auto"
+
+# 按名称匹配时使用的设备名关键字（包含匹配）
+target_device_names = [
+    "Xiaomi Smart Band 9",
+    "Xiaomi Smart Band 10",
+    "HUAWEI",
+    "HONOR",
+]
+
+# OSC 发送目标。本机 VRChat 保持默认即可；
+# 远程 VRChat（例如由 Linux 开发板采集）请填写运行 VRChat 主机的局域网 IPv4 地址；
+# Quest 一体机请填写头显的局域网 IPv4 地址；VRChat 修改过输入端口时请同步修改 osc_port。
+osc_ip = "127.0.0.1"
+osc_port = 9000
+
+# hr_percent 参数的分母（心率/该值 = 百分比）
+max_heart_rate_for_percent = 200.0
+
+# 每次扫描时长（秒）
+scan_duration_secs = 5
+
+# 断开后重试间隔（秒）
+retry_delay_secs = 5
+
+# 心跳超时时间（秒）：超过该时间未收到心率数据则断开重连
+heartbeat_timeout_secs = 15
+
+# 是否将心率实时写入程序目录下的 HeartRate.txt（供 OBS 等其他软件读取）。
+# 默认关闭以减少磁盘写入；需要 OBS 联动时改为 true。
+write_heart_rate_file = false

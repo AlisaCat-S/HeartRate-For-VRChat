@@ -13,17 +13,42 @@
         -   `strongest`：仅选择信号最强的心率设备（附近有他人的心率设备时可能连错，请留意程序打印的设备名）。
     -   内置心跳超时检测，当设备关机或断开连接时，程序会自动断开、清零状态并重新扫描连接。
 -   **状态判断**：当检测到心率值为 `0`、设备断开、或程序退出时，会向 VRChat 发送 `false` 的连接状态并清零心率，使 avatar 能够表现出"未佩戴"状态，不会残留旧心率。
--   **文本文件输出（可选，默认关闭）**：在 `config.toml` 中将 `write_heart_rate_file` 设为 `true` 后，当前心率值会实时写入程序（exe）所在目录下的 `HeartRate.txt` 文件（仅在数值变化时写入，减少磁盘操作）。这使得其他软件可以轻松读取该文件，实现更多联动，例如在 OBS 直播画面上显示心率。断开或退出时该文件会被写为 `0`。
+-   **文本文件输出（可选，默认关闭）**：在 `config.toml` 中将 `write_heart_rate_file` 设为 `true` 后，当前心率值会实时写入可执行文件所在目录下的 `HeartRate.txt` 文件（仅在数值变化时写入，减少磁盘操作）。这使得其他软件可以轻松读取该文件，实现更多联动，例如在 OBS 直播画面上显示心率。断开或退出时该文件会被写为 `0`。
+
+## 支持的平台
+
+每个版本标签会生成以下发布包：
+
+| 发布包 | 适用系统 |
+| --- | --- |
+| `HeartRate-For-VRChat-vX.Y.Z-windows-x86_64.zip` | 64 位 Windows |
+| `HeartRate-For-VRChat-vX.Y.Z-linux-x86_64.tar.gz` | 64 位 Intel/AMD Linux |
+| `HeartRate-For-VRChat-vX.Y.Z-linux-aarch64.tar.gz` | 64 位 ARM Linux 开发板，如使用 64 位系统的 Raspberry Pi、Orange Pi |
+
+Linux 发布包使用 glibc 2.31 作为最低兼容基线，可用于 Ubuntu 20.04、Debian 11、64 位 Raspberry Pi OS Bullseye 及更新的兼容发行版。首版不提供 32 位 ARM (`armv7`) 产物，也不附带 `systemd` 服务文件。
+
+### Linux 运行环境
+
+程序通过 BlueZ 和系统 D-Bus 访问蓝牙。在 Debian、Ubuntu、Raspberry Pi OS 等系统中可安装并启动以下运行环境：
+
+```bash
+sudo apt update
+sudo apt install bluez libdbus-1-3
+sudo systemctl enable --now bluetooth
+bluetoothctl show
+```
+
+如果普通用户访问蓝牙时被拒绝，请按所用发行版的规则授予该用户蓝牙权限（部分发行版要求加入 `bluetooth` 用户组），不要长期使用 root 运行程序。
 
 ## 🔧 配置文件
 
-首次运行时会在 exe 同目录自动生成 `config.toml`，可修改后重启程序生效：
+发布包内已经包含可直接编辑的 `config.toml`。如果文件缺失，程序会在可执行文件所在目录自动生成默认配置；因此请把发布包解压到当前用户可写的目录。修改配置后重启程序生效：
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `selection_mode` | `"auto"` | 设备选择模式：`auto` / `name` / `strongest` |
 | `target_device_names` | 小米/华为/荣耀等 | 名称匹配关键字列表（包含匹配） |
-| `osc_ip` | `"127.0.0.1"` | OSC 目标 IP。Quest 一体机请改为头显的局域网 IP |
+| `osc_ip` | `"127.0.0.1"` | OSC 目标 IPv4。本机 VRChat 保持默认；远程电脑或 Quest 请填写目标设备的局域网 IPv4 |
 | `osc_port` | `9000` | OSC 目标端口。VRChat 用 `--osc` 改过端口的请同步修改 |
 | `max_heart_rate_for_percent` | `200.0` | `hr_percent` 参数的分母 |
 | `scan_duration_secs` | `5` | 每次扫描时长（秒） |
@@ -60,14 +85,41 @@
 
 ## 🚀 如何使用
 
-1.  从本项目的 **Releases** 页面下载最新的可执行文件。
-2.  确保您的电脑已开启蓝牙功能。
-3.  开启您的心率监测设备或功能，并确保它没有被其他设备 (`Pulsoid/码表`) 连接。
-4.  执行下载的 `.exe` 文件（首次运行会生成 `config.toml`，一般无需修改）。
-5.  程序将开始扫描设备。成功连接后，您会在终端窗口中看到实时的心率数据。请核对打印的设备名是否是您自己的设备。
-6.  检查 VRChat，并确保已在 **菜单** 中启用了 OSC，并且 Avatar 使用上方参数表中的参数。
+1.  从本项目的 **Releases** 页面下载与系统和 CPU 架构对应的发布包并解压。
+2.  确保系统蓝牙和蓝牙服务已开启。
+3.  开启心率监测设备或功能，并确保它没有被其他设备 (`Pulsoid/码表`) 连接。
+4.  按需编辑发布包中的 `config.toml`。
+5.  Windows 运行 `HeartRate-For-VRChat.exe`；Linux 在解压目录执行：
+
+    ```bash
+    chmod +x HeartRate-For-VRChat
+    ./HeartRate-For-VRChat
+    ```
+
+6.  程序开始扫描后，核对终端打印的设备名。成功连接后会持续显示实时心率。
+7.  检查 VRChat，并确保已在菜单中启用 OSC，且 Avatar 使用上方参数表中的参数。
 
 提示：VRChat 未启动时程序也可正常运行，会在 VRChat 启动后自动生效。
+
+Linux 下使用 `Ctrl-C` 或发送 `SIGTERM` 正常停止程序时，会先向配置的 OSC 目标发送未连接和心率清零状态。
+
+## 从 Linux 开发板发送到另一台 VRChat 主机
+
+程序已经支持把 OSC 发送到局域网中的其他 IPv4 主机，不需要中转服务。在 Linux 开发板的 `config.toml` 中设置：
+
+```toml
+osc_ip = "192.168.1.100" # 运行 VRChat 的电脑局域网 IPv4
+osc_port = 9000           # VRChat 默认 OSC 输入端口
+```
+
+同时确认：
+
+1.  开发板与 VRChat 主机网络互通，且地址不是访客网络隔离后的地址。
+2.  VRChat 主机已启用 OSC。
+3.  VRChat 主机防火墙允许来自开发板的入站 UDP 9000；如果 VRChat 修改了 OSC 输入端口，`osc_port` 和防火墙规则必须同步修改。
+4.  `osc_ip` 目前只接受 IPv4，不接受主机名或 IPv6；配置非法时程序会明确警告并回退到 `127.0.0.1`。
+
+VRChat 启动参数 `--osc=inPort:senderIP:outPort` 中间的 `senderIP` 控制 VRChat 将**出站** OSC 发往哪里。仅接收本程序发送的心率时，不需要把它改成开发板地址。
 
 ## 🪶 性能说明
 
